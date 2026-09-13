@@ -19304,7 +19304,7 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                             response_headers=dict(response.headers),
                             response_body=text,
                             stage="http_submit",
-                            attempt=attempt + 1,
+                            attempt=index + 1,
                             session_key=session_key,
                             backend="agnes",
                             model=model,
