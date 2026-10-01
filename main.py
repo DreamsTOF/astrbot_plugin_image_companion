@@ -27,7 +27,7 @@ from .comfyui_workflows import WorkflowError
 
 
 PLUGIN_NAME = "astrbot_plugin_image_companion"
-PLUGIN_VERSION = "0.4.6"
+PLUGIN_VERSION = "0.4.5"
 PLUGIN_DISPLAY_NAME = "我会画给你看"
 STATUS_SCHEMA_VERSION = "image.status.v1"
 API_VERSION = "image.generation-api.v1"

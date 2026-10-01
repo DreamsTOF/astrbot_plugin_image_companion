@@ -99,7 +99,7 @@ class ExternalRouteRestrictionTests(unittest.IsolatedAsyncioTestCase):
         config.update(overrides)
         return config
 
-    async def run_generation(self, endpoint: dict, *, reference: bool = False):
+    async def run_generation(self, endpoint: dict, *, reference: bool = False, image_size: str = "1024x1024"):
         with patch.object(ImageGenerationRuntime, "_append_photo_generation_http_exchange"):
             return await self.runtime._run_external_photo_generation_with_endpoint(
                 endpoint,
@@ -107,7 +107,7 @@ class ExternalRouteRestrictionTests(unittest.IsolatedAsyncioTestCase):
                 session_key=_SESSION_KEY,
                 reference_image_path=str(self.reference) if reference else "",
                 reference_image_paths=(str(self.reference),) if reference else (),
-                image_size="1024x1024",
+                image_size=image_size,
             )
 
     # 1. 模型名不再受本地白名单限制 -------------------------------
@@ -259,6 +259,84 @@ class ExternalRouteRestrictionTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.image_path, outcome.note)
         payload = session.post.call_args.kwargs["json"]
         self.assertEqual(payload["model"], "sensenova-future-model")
+
+    # 7. 参考图统一归一化 ----------------------------------------
+
+    def test_oversized_reference_is_scaled_proportionally(self) -> None:
+        import io
+
+        from PIL import Image as PILImage
+
+        source = PILImage.new("RGB", (2400, 1000), (200, 30, 30))
+        buffer = io.BytesIO()
+        source.save(buffer, "JPEG")
+        data, mime = ImageGenerationRuntime._downscale_reference_image_bytes(
+            buffer.getvalue()
+        )
+        self.assertEqual(mime, "image/jpeg")
+        with PILImage.open(io.BytesIO(data)) as scaled:
+            self.assertEqual(scaled.size, (2048, 853))
+        self.assertLess(len(data), len(buffer.getvalue()))
+
+    def test_oversized_transparent_reference_stays_png(self) -> None:
+        import io
+
+        from PIL import Image as PILImage
+
+        source = PILImage.new("RGBA", (3000, 500), (255, 0, 0, 128))
+        buffer = io.BytesIO()
+        source.save(buffer, "PNG")
+        data, mime = ImageGenerationRuntime._downscale_reference_image_bytes(
+            buffer.getvalue()
+        )
+        self.assertEqual(mime, "image/png")
+        with PILImage.open(io.BytesIO(data)) as scaled:
+            self.assertEqual(scaled.size, (2048, 341))
+            self.assertEqual(scaled.mode, "RGBA")
+
+    def test_within_limit_reference_passes_through_verbatim(self) -> None:
+        original = _png_bytes()
+        data, mime = ImageGenerationRuntime._downscale_reference_image_bytes(original)
+        self.assertEqual(data, original)
+        self.assertEqual(mime, "image/png")
+
+    async def test_reference_data_url_is_normalized(self) -> None:
+        import io
+
+        from PIL import Image as PILImage
+
+        oversized = self.directory / "oversized.png"
+        source = PILImage.new("RGB", (2400, 1000), (10, 120, 240))
+        source.save(oversized, "PNG")
+        data_url = await self.runtime._reference_image_to_data_url(str(oversized))
+        header, encoded = data_url.split(",", 1)
+        self.assertEqual(header, "data:image/jpeg;base64")
+        with PILImage.open(io.BytesIO(base64.b64decode(encoded))) as scaled:
+            self.assertEqual(scaled.size, (2048, 853))
+
+    async def test_modelscope_output_size_passes_through_verbatim(self) -> None:
+        # 用户填 4096 就提交 4096：不本地钳制，服务端不支持就返回错误。
+        endpoint = self.endpoint(
+            platform="modelscope",
+            base_url="https://api-inference.modelscope.cn/",
+            model="Qwen/Qwen-Image-2.1",
+            size="4096x4096",
+        )
+        session = _session(
+            _response(200, {"task_id": "task-1"}),
+            gets=(
+                _response(
+                    200,
+                    {"task_status": "SUCCEED", "output_images": [_b64_png_data_url()]},
+                ),
+            ),
+        )
+        with patch("aiohttp.ClientSession", return_value=session):
+            outcome = await self.run_generation(endpoint, image_size="")
+
+        self.assertTrue(outcome.image_path, outcome.note)
+        payload = session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["size"], "4096x4096")
 
     # 2. SenseNova 尺寸不再强制映射旧档位 -------------------------
 

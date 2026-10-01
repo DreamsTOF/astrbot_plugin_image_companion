@@ -268,6 +268,10 @@ _EXTERNAL_IMAGE_DOWNLOAD_RETRY_DELAY_SECONDS = 0.8
 _EXTERNAL_IMAGE_DOWNLOAD_TOTAL_TIMEOUT_SECONDS = 75.0
 _EXTERNAL_IMAGE_DOWNLOAD_ATTEMPT_TIMEOUT_SECONDS = 35.0
 _MINIMAX_REFERENCE_IMAGE_MAX_BYTES = 10 * 1024 * 1024
+# 参考图统一归一化上限：各平台输入图（含魔搭 API-Inference 的 2048 硬限制）
+# 共用同一个安全边长，超限时按原始比例缩放后再提交。
+_REFERENCE_IMAGE_MAX_SIDE = 2048
+_REFERENCE_IMAGE_JPEG_QUALITY = 92
 
 _EXTERNAL_IMAGE_DOWNLOAD_TIMEOUT_OVERRIDE: ContextVar[float | None] = ContextVar(
     "private_companion_external_image_download_timeout_override",
@@ -17281,6 +17285,64 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             deduped.append(value)
         return deduped
 
+    @staticmethod
+    def _downscale_reference_image_bytes(
+        image_bytes: bytes,
+        *,
+        max_side: int = _REFERENCE_IMAGE_MAX_SIDE,
+        fallback_mime: str = "",
+    ) -> tuple[bytes, str]:
+        """把超过 ``max_side`` 的参考图按原始比例缩放，返回 ``(bytes, mime)``。
+
+        所有在线生图路径的参考图提交前都应经过这里：尺寸在限制内时原样
+        返回（不重编码、无损画质）；超限时等比缩小并按透明度选择
+        PNG/JPEG 重编码。Pillow 不可用或解码失败时保持原图提交。
+        """
+        if image_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+            original_mime = "image/png"
+        elif image_bytes.startswith(b"\xff\xd8\xff"):
+            original_mime = "image/jpeg"
+        elif image_bytes.startswith(b"RIFF") and image_bytes[8:12] == b"WEBP":
+            original_mime = "image/webp"
+        else:
+            original_mime = fallback_mime
+        if not image_bytes:
+            return image_bytes, fallback_mime
+        try:
+            from io import BytesIO
+
+            from PIL import Image, ImageOps
+
+            with Image.open(BytesIO(image_bytes)) as img:
+                normalized = ImageOps.exif_transpose(img)
+                width, height = normalized.size
+                if max(width, height) <= max_side:
+                    return image_bytes, original_mime
+                scale = max_side / float(max(width, height))
+                target = (max(1, round(width * scale)), max(1, round(height * scale)))
+                has_alpha = normalized.mode in ("RGBA", "LA") or (
+                    normalized.mode == "P" and "transparency" in normalized.info
+                )
+                buffer = BytesIO()
+                if has_alpha:
+                    normalized.resize(target, Image.LANCZOS).save(buffer, format="PNG")
+                    return buffer.getvalue(), "image/png"
+                rgb = normalized.convert("RGB").resize(target, Image.LANCZOS)
+                rgb.save(buffer, format="JPEG", quality=_REFERENCE_IMAGE_JPEG_QUALITY)
+                return buffer.getvalue(), "image/jpeg"
+        except ImportError:
+            logger.info(
+                "[PrivateCompanion] Pillow 不可用，参考图按原始尺寸提交: max_side=%s",
+                max_side,
+            )
+            return image_bytes, original_mime
+        except Exception as exc:  # noqa: BLE001
+            logger.info(
+                "[PrivateCompanion] 参考图缩放失败,按原图提交: %s",
+                _single_line(exc, 120),
+            )
+            return image_bytes, original_mime
+
     async def _reference_image_to_data_url(self, reference_image_path: str) -> str:
         path = Path(str(reference_image_path or ""))
         if not path.exists() or not path.is_file():
@@ -17295,6 +17357,10 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         if not mime_type:
             return ""
         image_bytes = await asyncio.to_thread(path.read_bytes)
+        image_bytes, mime_type = self._downscale_reference_image_bytes(
+            image_bytes,
+            fallback_mime=mime_type,
+        )
         encoded = base64.b64encode(image_bytes).decode("ascii")
         return f"data:{mime_type};base64,{encoded}"
 
@@ -20165,9 +20231,22 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                     content_type = "image/jpeg"
                 elif suffix == ".webp":
                     content_type = "image/webp"
-                image_payloads.append(
-                    (path, await asyncio.to_thread(path.read_bytes), content_type)
+                raw_bytes = await asyncio.to_thread(path.read_bytes)
+                normalized_bytes, content_type = self._downscale_reference_image_bytes(
+                    raw_bytes,
+                    fallback_mime=content_type,
                 )
+                image_payloads.append((path, normalized_bytes, content_type))
+
+            def _reference_filename(index: int, mime_type: str) -> str:
+                extension = (
+                    ".png"
+                    if mime_type.endswith("png")
+                    else ".webp"
+                    if mime_type.endswith("webp")
+                    else ".jpg"
+                )
+                return f"reference_{index}{extension}"
 
             def build_form() -> Any:
                 form = aiohttp.FormData()
@@ -20175,11 +20254,11 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 form.add_field("prompt", submitted_prompt_text)
                 form.add_field("size", self._sanitize_external_image_size(image_size))
                 multi = len(image_payloads) > 1
-                for index, (path, image_bytes, content_type) in enumerate(image_payloads, start=1):
+                for index, (_path, image_bytes, content_type) in enumerate(image_payloads, start=1):
                     form.add_field(
                         "image[]" if multi else "image",
                         image_bytes,
-                        filename=f"reference_{index}{path.suffix.lower()}",
+                        filename=_reference_filename(index, content_type),
                         content_type=content_type,
                     )
                 return form
@@ -20234,11 +20313,11 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                                 "multipart_reference_count": len(image_payloads),
                                 "multipart_reference_bytes": [
                                     {
-                                        "filename": f"reference_{index}{path.suffix.lower()}",
+                                        "filename": _reference_filename(index, content_type),
                                         "content_type": content_type,
                                         "bytes": image_bytes,
                                     }
-                                    for index, (path, image_bytes, content_type) in enumerate(image_payloads, start=1)
+                                    for index, (_path, image_bytes, content_type) in enumerate(image_payloads, start=1)
                                 ],
                             }
                             self._append_photo_generation_http_exchange(
