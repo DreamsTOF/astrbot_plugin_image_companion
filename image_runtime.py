@@ -15553,16 +15553,6 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         # Current reference-capable adapters accept one reference_image_path.
         return 1
 
-    @staticmethod
-    def _external_image_model_supports_multi_reference(model_name: Any) -> bool:
-        model = str(model_name or "").strip().lower()
-        return bool(
-            re.search(
-                r"(?:^|[-_/:.])gpt[-_]?image[-_]?2(?:$|[-_/:.])",
-                model,
-            )
-        )
-
     def _external_image_endpoint_multi_reference_capacity(
         self,
         endpoint: dict[str, Any],
@@ -15584,12 +15574,11 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             # use its common documented ceiling while preserving prompt-side
             # projection when a request carries more assets.
             return min(requested, 3)
-        if platform != "openai" or not self._external_image_model_supports_multi_reference(
-            endpoint.get("model")
-        ):
+        if platform != "openai":
             return 1
-        # Keep an application-side ceiling below the API maximum so a role-card
-        # group request cannot create an unexpectedly large multipart body.
+        # 多参考图容量不再限定 gpt-image-2 等具体模型名：OpenAI 兼容端点
+        # 统一按请求投影，失败时由提交链路自然回退。应用层上限保留 8 张，
+        # 避免群聊请求生成异常庞大的 multipart 请求体。
         return min(requested, 8)
 
     def _external_image_api_capacity_endpoint_snapshot(self) -> list[dict[str, Any]]:
@@ -16680,46 +16669,37 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         normalizer = getattr(self, "_normalize_external_image_api_platform", None)
         platform = normalizer(configured) if callable(normalizer) else str(configured or "auto").strip().lower()
         raw_base = str(base_url or "").strip().lower()
-        model = str(model_name or "").strip().lower()
+        # model_name 参数保留以兼容旧调用，但不再参与平台识别。
         if platform == "openrouter" or (
             platform in {"auto", "openai"}
             and self._external_image_api_is_openrouter_url(raw_base)
         ):
             return "openrouter"
-        if platform in {"auto", "openai"} and (
-            "apihub.agnes-ai.com" in raw_base or model.startswith("agnes-image-")
-        ):
+        if platform in {"auto", "openai"} and "apihub.agnes-ai.com" in raw_base:
             return "agnes"
         minimax_official_host = any(
             host in raw_base
             for host in ("api.minimaxi.com", "api.minimax.io", "minimaxi.com", "minimax.io")
         )
-        if (
-            platform in {"auto", "openai"} and minimax_official_host
-        ) or (
-            platform == "auto" and model in {"image-01", "image-01-live"}
-        ):
+        if platform in {"auto", "openai"} and minimax_official_host:
             return "minimax"
         if platform in {"openai", "openrouter", "agnes", "bailian", "modelscope", "doubao", "gemini", "sensenova", "minimax"}:
             return platform
+        # 平台路由只由显式配置与 API 地址决定，模型名不参与识别：
+        # 服务商今后改任何模型名（比如商汤不再叫 sensenova）都不影响路由，
+        # 需要指定协议时在配置里显式选择平台即可。
         base = self._normalized_external_image_api_base_url(raw_base, platform=platform).lower()
-        if "apihub.agnes-ai.com" in base or model.startswith("agnes-image-"):
+        if "apihub.agnes-ai.com" in base:
             return "agnes"
-        if "token.sensenova.cn" in base or model in {"senova-u1-fast", "sensenova-u1-fast"}:
+        if "token.sensenova.cn" in base:
             return "sensenova"
         if any(token in base for token in ("volces.com", "volcengine.com", "ark.cn-", "ark.ap-", "visual.volcengineapi.com")):
             return "doubao"
-        if model.startswith(("doubao", "seedream")) or "seedream" in model:
-            return "doubao"
         if any(token in base for token in ("generativelanguage.googleapis.com", "googleapis.com/v1beta/models")):
-            return "gemini"
-        if model.startswith(("gemini", "imagen")) or "nano-banana" in model:
             return "gemini"
         if "modelscope" in base or "api-inference" in base:
             return "modelscope"
         if any(token in base for token in ("dashscope.aliyuncs.com", "/services/aigc/", "/api/v1/tasks", "model-studio")):
-            return "bailian"
-        if model.startswith(("qwen-image", "wanx", "wan-", "wan2.", "wan2x", "wan")):
             return "bailian"
         return "openai"
 
@@ -17033,6 +17013,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         if not match:
             return "2752x1536"
         width, height = int(match.group(1)), int(match.group(2))
+        # U1.5 系列官方约束：宽高为 32 的倍数、512~4096、比例不超过 3:1。
+        # 满足约束的尺寸直接透传，不再强制映射到旧 U1 Fast 信息图档位。
+        if (
+            512 <= width <= 4096
+            and 512 <= height <= 4096
+            and width % 32 == 0
+            and height % 32 == 0
+            and max(width / max(1, height), height / max(1, width)) <= 3.0
+        ):
+            return f"{width}x{height}"
         if (width, height) in supported:
             return f"{width}x{height}"
         ratio = width / max(1, height)
@@ -17470,37 +17460,11 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         configured_platform: Any = "auto",
         base_url: Any = "",
     ) -> str:
+        # 模型名不再做本地白名单校验：各平台/代理会自行返回明确的
+        # “模型不支持 images 接口”等错误，这里只拦截完全未配置的情况。
         model = _single_line(model_name, 120)
         if not model:
             return "未配置在线图片模型"
-        lowered = model.lower()
-        platform = self._resolved_external_image_api_platform_for_values(
-            configured=configured_platform,
-            base_url=base_url,
-            model_name=model,
-        )
-        image_tokens = ("image", "img", "dall", "flux", "sd", "stable-diffusion", "midjourney", "mj", "kolors", "wanx", "wan", "seedream", "imagen", "nano-banana")
-        text_model_prefixes = ("gpt-", "claude", "gemini", "deepseek", "qwen", "glm", "moonshot", "kimi", "yi-", "doubao")
-        if platform == "bailian" and (lowered.startswith("qwen-image") or lowered.startswith("wan")):
-            return ""
-        if platform == "doubao" and (lowered.startswith(("doubao-seedream", "seedream")) or "seedream" in lowered):
-            return ""
-        if platform == "gemini" and any(token in lowered for token in ("image", "imagen", "nano-banana")):
-            return ""
-        if platform == "agnes":
-            if lowered.startswith("agnes-image-"):
-                return ""
-            return "Agnes Image 必须填写图片模型 ID，例如 agnes-image-2.1-flash"
-        if platform == "sensenova":
-            if lowered in {"senova-u1-fast", "sensenova-u1-fast"}:
-                return ""
-            return "SenseNova 日日新信息图模型必须填写官方 Model ID：sensenova-u1-fast"
-        if platform == "minimax":
-            if lowered in {"image-01", "image-01-live"}:
-                return ""
-            return "MiniMax 图片接口必须填写官方 Model ID：image-01 或 image-01-live"
-        if lowered.startswith(text_model_prefixes) and not any(token in lowered for token in image_tokens):
-            return f"在线图片模型填成了文本/聊天模型：{model}。请改成该平台的图片模型名，例如支持 /images/generations 或 /images/edits 的模型。"
         return ""
 
     def _external_image_model_misconfiguration_note(self) -> str:
@@ -18467,11 +18431,145 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             logger.warning("[PrivateCompanion] 百炼异步生图失败: %s", safe_error)
             return "", safe_error
 
+    async def _run_sensenova_photo_edits(
+        self,
+        prompt_text: str,
+        *,
+        session_key: str,
+        reference_image_path: str,
+        reference_image_paths: Any = (),
+        image_size: str = "",
+    ) -> tuple[str, str]:
+        endpoint = self._external_image_endpoint("edits")
+        if not endpoint:
+            return "", "未配置 SenseNova 日日新 API 地址"
+        try:
+            import aiohttp
+
+            raw_paths = reference_image_paths
+            if isinstance(raw_paths, str):
+                raw_paths = (raw_paths,)
+            image_entries: list[dict[str, str]] = []
+            for raw_path in (reference_image_path, *(raw_paths or ())):
+                clean_path = _path_text(raw_path, 1000)
+                if not clean_path:
+                    continue
+                lowered = clean_path.lower()
+                if lowered.startswith(("http://", "https://")):
+                    image_entries.append({"image_url": clean_path})
+                    continue
+                data_url = await self._reference_image_to_data_url(clean_path)
+                if not data_url:
+                    return "", "SenseNova 参考图无法读取或转换，已停止请求"
+                image_entries.append({"image_url": data_url})
+            if not image_entries:
+                return "", "SenseNova 参考图不可用"
+            payload: dict[str, Any] = {
+                "model": self._sensenova_image_model(),
+                "images": image_entries,
+                "prompt": prompt_text,
+                "n": 1,
+                "size": "auto",
+                "response_format": "b64_json",
+            }
+            # 参考图编辑使用官方 auto 尺寸，自动适配主图，避免破坏原图构图。
+            headers = {
+                "Authorization": f"Bearer {self.external_image_api_key}",
+                "Content-Type": "application/json",
+            }
+            headers.update(self._external_image_custom_headers())
+            timeout = aiohttp.ClientTimeout(total=float(self.external_image_api_timeout_seconds))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                logger.info(
+                    "[PrivateCompanion] SenseNova 参考图编辑提交: endpoint=%s model=%s reference_count=%s prompt_preview=%s",
+                    self._external_image_diagnostic_text(endpoint, 160),
+                    _single_line(self.external_image_api_model, 80),
+                    len(image_entries),
+                    _single_line(prompt_text, 180),
+                )
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_edit",
+                        session_key=session_key,
+                        backend="sensenova",
+                        model=self.external_image_api_model,
+                    )
+                    logger.info(
+                        "[PrivateCompanion] SenseNova 参考图编辑响应: status=%s chars=%s preview=%s",
+                        response.status,
+                        len(text or ""),
+                        self._external_image_diagnostic_text(text, 220),
+                    )
+                    if response.status >= 400:
+                        return "", self._external_image_api_error_note(
+                            response.status,
+                            text,
+                            reference=True,
+                            endpoint=endpoint,
+                        )
+                data = self._extract_json_payload(text) if text else {}
+                if not isinstance(data, dict):
+                    return "", "SenseNova 参考图编辑返回格式无效"
+                items = data.get("data")
+                first = items[0] if isinstance(items, list) and items else None
+                if not isinstance(first, dict):
+                    message = self._external_payload_first_value(data, ("message", "msg", "error"))
+                    return "", _single_line(message or "SenseNova 参考图编辑未返回图片数据", 180)
+                return await self._materialize_external_openai_image_item(
+                    first,
+                    session_key=session_key,
+                    success_note="ok；已使用参考图",
+                )
+        except asyncio.TimeoutError as exc:
+            note = self._external_image_timeout_note(reference=True)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="sensenova",
+                model=self.external_image_api_model,
+                error=exc,
+            )
+            logger.info(
+                "[PrivateCompanion] SenseNova 参考图编辑超时: model=%s timeout=%ss",
+                _single_line(self.external_image_api_model, 80),
+                _safe_int(getattr(self, "external_image_api_timeout_seconds", 180), 180, 1),
+            )
+            return "", note
+        except Exception as e:
+            safe_error = self._external_image_diagnostic_text(e, 220)
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=endpoint,
+                request_headers=locals().get("headers"),
+                request_body=locals().get("payload"),
+                stage="http_exception",
+                session_key=session_key,
+                backend="sensenova",
+                model=self.external_image_api_model,
+                error=e,
+            )
+            logger.warning("[PrivateCompanion] SenseNova 参考图编辑失败: %s", safe_error)
+            return "", safe_error
+
     async def _run_modelscope_photo_generation(
         self,
         prompt_text: str,
         *,
         session_key: str,
+        reference_image_path: str = "",
+        reference_image_paths: Any = (),
         image_size: str = "",
     ) -> tuple[str, str]:
         endpoint = self._modelscope_generation_endpoint()
@@ -18480,11 +18578,13 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
         try:
             import aiohttp
 
+            # 魔搭 API-Inference 当前任务类型仅支持 image_generation 等取值；
+            # 提交与轮询都需要携带该请求头。
             headers = {
                 "Authorization": f"Bearer {self.external_image_api_key}",
                 "Content-Type": "application/json",
                 "X-ModelScope-Async-Mode": "true",
-                "X-ModelScope-Task-Type": "text-to-image-generation",
+                "X-ModelScope-Task-Type": "image_generation",
             }
             headers.update(self._external_image_custom_headers())
             payload = {
@@ -18492,6 +18592,34 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 "prompt": prompt_text,
                 "size": self._sanitize_external_image_size(image_size),
             }
+            raw_paths = reference_image_paths
+            if isinstance(raw_paths, str):
+                raw_paths = (raw_paths,)
+            image_urls: list[str] = []
+            requested_reference_count = 0
+            for raw_path in (reference_image_path, *(raw_paths or ())):
+                clean_path = _path_text(raw_path, 1000)
+                if not clean_path:
+                    continue
+                requested_reference_count += 1
+                lowered = clean_path.lower()
+                if lowered.startswith(("http://", "https://")):
+                    if clean_path not in image_urls:
+                        image_urls.append(clean_path)
+                    continue
+                data_url = await self._reference_image_to_data_url(clean_path)
+                if not data_url:
+                    logger.info(
+                        "[PrivateCompanion] 魔搭参考图无法读取,已跳过: path=%s",
+                        _single_line(clean_path, 160),
+                    )
+                    continue
+                if data_url not in image_urls:
+                    image_urls.append(data_url)
+            if requested_reference_count and not image_urls:
+                return "", "魔搭参考图无法读取或转换，已停止纯文生图回退"
+            if image_urls:
+                payload["image_url"] = image_urls[:10]
             timeout = aiohttp.ClientTimeout(total=float(self.external_image_api_timeout_seconds))
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 logger.info(
@@ -19746,12 +19874,12 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 return "", f"{note}；多模态回退原因：{_single_line(bailian_note, 120)}"
             return "", note
         if platform == "modelscope":
-            if reference_image_path:
-                return "", "魔搭社区文生图接口暂不支持参考图输入，请改用 OpenAI 兼容参考图接口或 ComfyUI images=1 工作流"
             return self._coerce_external_photo_generation_outcome(
                 await self._run_modelscope_photo_generation(
                     prompt_text,
                     session_key=session_key,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
                     image_size=image_size,
                 )
             )
@@ -19802,7 +19930,16 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                 )
             )
         if platform == "sensenova" and reference_image_path:
-            return "", "SenseNova U1 Fast 官方接口不支持参考图输入，请使用纯文生图或切换其他参考图后端"
+            # U1.5 系列已开放 /v1/images/edits 参考图编辑，走 JSON images 协议。
+            return self._coerce_external_photo_generation_outcome(
+                await self._run_sensenova_photo_edits(
+                    prompt_text,
+                    session_key=session_key,
+                    reference_image_path=reference_image_path,
+                    reference_image_paths=reference_image_paths,
+                    image_size=image_size,
+                )
+            )
         if reference_image_path and not os.path.isfile(reference_image_path):
             return "", "在线图片 API 提交前参考图已不可用，已停止纯文生图回退"
         if reference_image_path:
@@ -19843,6 +19980,8 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             }
             if platform == "sensenova":
                 payload["n"] = 1
+                # SenseNova 返回的图片 URL 只有 24 小时有效期，优先直接取回 base64。
+                payload["response_format"] = "b64_json"
             headers = {
                 "Authorization": f"Bearer {self.external_image_api_key}",
                 "Content-Type": "application/json",
@@ -20132,14 +20271,25 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
                                         self._external_image_diagnostic_text(endpoints[index + 1], 160),
                                     )
                                     break
-                                return "", last_error_note
+                                # 非 404 失败不再直接返回，保留错误说明并走 JSON 回退。
+                                break
                         data = self._extract_json_payload(text) if text else {}
                         break
                     if data is None and last_error_note and index + 1 < len(endpoints):
                         continue
                     break
             if data is None:
-                return "", last_error_note or "参考图接口未返回数据"
+                fallback_note = last_error_note or "参考图接口未返回数据"
+                # 部分 OpenAI 兼容代理与 SenseNova 系模型不接受 multipart 表单，
+                # 只支持 JSON images 数组；multipart 明确失败时尝试一次 JSON 提交。
+                json_outcome = await self._run_external_photo_edit_generation_json(
+                    prompt_text=submitted_prompt_text,
+                    session_key=session_key,
+                    image_payloads=image_payloads,
+                )
+                if json_outcome.image_path:
+                    return json_outcome
+                return "", fallback_note
             if not isinstance(data, dict):
                 return "", "参考图接口返回格式无效"
             first = None
@@ -20206,6 +20356,122 @@ continuity_mode 只能是 continuation、edit、new_topic、ambiguous。
             )
             logger.warning("[PrivateCompanion] 在线图片 API 参考图生图失败: %s", safe_error)
             return "", safe_error
+
+    async def _run_external_photo_edit_generation_json(
+        self,
+        *,
+        prompt_text: str,
+        session_key: str,
+        image_payloads: list[tuple[Path, bytes, str]],
+    ) -> _ExternalPhotoGenerationOutcome:
+        """Submit the edits request as JSON ``images[].image_url`` entries.
+
+        部分 OpenAI 兼容代理（如转发 SenseNova U1.5 系列）不接受 multipart
+        表单，仅接受 JSON images 数组；本方法作为 multipart 失败后的回退。
+        """
+        try:
+            import aiohttp
+
+            endpoint = self._external_image_endpoint("edits")
+            if not endpoint:
+                return _ExternalPhotoGenerationOutcome("", "未配置在线图片 API 地址")
+            payload: dict[str, Any] = {
+                "model": self.external_image_api_model,
+                "prompt": prompt_text,
+                "n": 1,
+                "response_format": "b64_json",
+                "images": [
+                    {
+                        "image_url": (
+                            f"data:{content_type};base64,"
+                            f"{base64.b64encode(image_bytes).decode('ascii')}"
+                        )
+                    }
+                    for _path, image_bytes, content_type in image_payloads
+                ],
+            }
+            headers = {
+                "Authorization": f"Bearer {self.external_image_api_key}",
+                "Content-Type": "application/json",
+            }
+            headers.update(self._external_image_custom_headers())
+            timeout = aiohttp.ClientTimeout(total=float(self.external_image_api_timeout_seconds))
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                logger.info(
+                    "[PrivateCompanion] 在线图片 API 参考图 JSON 回退提交: endpoint=%s model=%s reference_count=%s prompt_preview=%s",
+                    self._external_image_diagnostic_text(endpoint, 160),
+                    _single_line(self.external_image_api_model, 80),
+                    len(image_payloads),
+                    _single_line(prompt_text, 180),
+                )
+                async with session.post(endpoint, headers=headers, json=payload) as response:
+                    text = await response.text()
+                    self._append_photo_generation_http_exchange(
+                        method="POST",
+                        endpoint=endpoint,
+                        request_headers=headers,
+                        request_body=payload,
+                        response_status=response.status,
+                        response_headers=dict(response.headers),
+                        response_body=text,
+                        stage="http_edit_json",
+                        session_key=session_key,
+                        backend=self._resolved_external_image_api_platform() or "external",
+                        model=self.external_image_api_model,
+                    )
+                    logger.info(
+                        "[PrivateCompanion] 在线图片 API 参考图 JSON 回退响应: endpoint=%s status=%s chars=%s preview=%s",
+                        self._external_image_diagnostic_text(endpoint, 160),
+                        response.status,
+                        len(text or ""),
+                        self._external_image_diagnostic_text(text, 220),
+                    )
+                    if response.status >= 400:
+                        return _ExternalPhotoGenerationOutcome(
+                            "",
+                            self._external_image_api_error_note(
+                                response.status,
+                                text,
+                                reference=True,
+                                endpoint=endpoint,
+                            ),
+                        )
+                data = self._extract_json_payload(text) if text else {}
+                if not isinstance(data, dict):
+                    return _ExternalPhotoGenerationOutcome("", "参考图 JSON 接口返回格式无效")
+                items = data.get("data")
+                first = items[0] if isinstance(items, list) and items else None
+                if not isinstance(first, dict):
+                    return _ExternalPhotoGenerationOutcome("", "参考图 JSON 接口未返回图片数据")
+                return await self._materialize_external_openai_image_item(
+                    first,
+                    session_key=session_key,
+                    success_note=(
+                        "ok；已使用参考图"
+                        if len(image_payloads) == 1
+                        else f"ok；已使用 {len(image_payloads)} 张参考图"
+                    ),
+                )
+        except asyncio.TimeoutError as exc:
+            note = self._external_image_timeout_note(reference=True)
+            logger.info(
+                "[PrivateCompanion] 在线图片 API 参考图 JSON 回退超时: model=%s",
+                _single_line(self.external_image_api_model, 80),
+            )
+            self._append_photo_generation_http_exchange(
+                method="POST",
+                endpoint=self._external_image_endpoint("edits"),
+                stage="http_exception",
+                session_key=session_key,
+                backend=self._resolved_external_image_api_platform() or "external",
+                model=self.external_image_api_model,
+                error=exc,
+            )
+            return _ExternalPhotoGenerationOutcome("", note)
+        except Exception as e:  # noqa: BLE001
+            safe_error = self._external_image_diagnostic_text(e, 220)
+            logger.warning("[PrivateCompanion] 在线图片 API 参考图 JSON 回退失败: %s", safe_error)
+            return _ExternalPhotoGenerationOutcome("", safe_error)
 
     def _find_photo_workflow_with_text_count(
         self,

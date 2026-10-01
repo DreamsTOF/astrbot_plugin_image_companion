@@ -2,6 +2,8 @@
 
 此插件为“我会永远陪着你”插件的拓展程序，请到其拓展页进行配置。
 
+0.4.6 移除在线图片 API 的本地模型白名单与参考图硬拦截：SenseNova 支持全部模型名并接入 U1.5 JSON 参考图编辑；魔搭社区任务类型修正为 `image_generation` 并支持 `image_url` 参考图；OpenAI 兼容改图在 multipart 被拒绝时自动回退 JSON images 协议；SenseNova 尺寸按官方 32 倍数规则透传。
+
 0.4.5 提示词重写使用实际槽位 JSON 示例，兼容省略包装、唯一节点输入别名和空负面词。模型超时、限流或返回无效内容时，自动使用原提示词和已确认语义槽继续生成，并在生成记录和正式任务结果中保留降级状态。工作流映射无效、原始内容不足或用户取消时停止；不会再次调用模型或重复生图。
 
 0.4.4 优化函数工具生图结果物化：统一校验 `data:image` 与 base64 图片签名，支持小型图片和带空格的相对路径，并继续在归档失败时保留明确的结果失败状态。
@@ -146,19 +148,20 @@ API 根地址即可，插件会补齐生成或编辑路径；也接受直接填�
 
 | 平台 | 平台值 | 地址/模型示例 | 参考图与协议 |
 | --- | --- | --- | --- |
-| OpenAI Images 兼容 | `openai` | `https://api.example.com/v1`；`gpt-image-1` | 文生图走 `/images/generations`；改图走 `/images/edits` multipart。能力取决于代理和模型 |
+| OpenAI Images 兼容 | `openai` | `https://api.example.com/v1`；`gpt-image-1` | 文生图走 `/images/generations`；改图先走 `/images/edits` multipart，被代理拒绝时自动回退 JSON `images[].image_url`（data URL）。能力取决于代理和模型 |
 | OpenRouter | `openrouter` | `https://openrouter.ai/api/v1`；填写可生成图片的模型 ID | 文生图兼容 Images；改图使用 JSON `input_references`，参考图会转为 data URL |
 | Agnes Image | `agnes` | `https://apihub.agnes-ai.com/v1`；如 `agnes-image-2.1-flash` | 支持文生图和参考图；可用 `ratio` 设置官方宽高比 |
-| SenseNova 日日新 | `sensenova` | 使用 SenseNova 控制台的 API 根地址；`sensenova-u1-fast` | 当前按纯文生图使用，参考图请切换其他后端 |
+| SenseNova 日日新 | `sensenova` | 使用 SenseNova 控制台的 API 根地址；如 `sensenova-u1.5-fast` | 文生图走 `/images/generations`；U1.5 系列参考图编辑走 JSON `/images/edits`，尺寸使用官方 `auto` 适配主图 |
 | MiniMax | `minimax` | `https://api.minimaxi.com/v1` 或 `https://api.minimax.io/v1`；`image-01`/`image-01-live` | 统一调用 `/image_generation`；每次最多提交 1 张 PNG/JPEG 参考图 |
 | 阿里云百炼 | `bailian` | `https://dashscope.aliyuncs.com/api/v1`；`qwen-image`、`wan` 系列 | Qwen/Wan 优先使用多模态 `input.messages`；带参考图时不会回退为纯文生图 |
-| 魔搭社区 | `modelscope` | 使用魔搭 API 根地址；填写对应图片模型 | 使用异步任务和轮询；当前不接收参考图 |
+| 魔搭社区 | `modelscope` | 使用魔搭 API 根地址；填写对应图片模型 | 异步任务和轮询（任务类型 `image_generation`）；参考图通过请求体 `image_url` 列表提交（公网链接或 data URL），最多 10 张 |
 | 豆包/火山方舟 | `doubao` | 使用 Ark API 根地址（通常 `/api/v3`）；`seedream`/`doubao-seedream` | 调用图片生成接口；当前不接收参考图 |
 | Gemini | `gemini` | `https://generativelanguage.googleapis.com/v1beta`；支持图片输出的 Gemini 模型 | 调用 `models/{model}:generateContent`，支持文本和参考图；不适用于 Imagen 的 `:predict` 接口 |
 
 `平台`填 `auto` 时会根据地址和模型名自动识别。Agnes、SenseNova 等兼容值也可以直接写入
-端点配置，即使面板下拉列表未显示。模型必须是图片模型；把聊天模型填到这里通常会得到
-“模型不支持 images 接口”的错误。
+端点配置，即使面板下拉列表未显示。插件不再在本地限制模型名；只有完全未填写模型时才会
+提示。模型与接口不匹配时，服务商通常会返回“模型不支持 images 接口”之类的错误，照错误
+信息调整即可。
 
 #### 多端点和回退
 
@@ -311,9 +314,10 @@ NAI 路线只负责 NovelAI 标签和负面提示词编译。若使用 NovelAI �
 
 ### 参考图能力速查
 
-- 支持参考图：正确配置的 OpenAI 兼容编辑接口、OpenRouter、Agnes、MiniMax、Gemini，以及
-  声明 `images>=1` 的 ComfyUI 工作流。
-- 当前纯文生图：SenseNova U1 Fast、SDGen、魔搭社区、豆包/火山方舟。
+- 支持参考图：正确配置的 OpenAI 兼容编辑接口（multipart 被拒绝时自动回退 JSON images 协议）、
+  OpenRouter、Agnes、SenseNova U1.5 系列（JSON images 协议）、MiniMax、魔搭社区
+  （异步任务 `image_url` 列表）、Gemini，以及声明 `images>=1` 的 ComfyUI 工作流。
+- 当前纯文生图：SDGen、豆包/火山方舟。
 - 百炼的 Qwen/Wan 图片模型使用多模态协议；带参考图时必须保证模型和端点支持该协议。
 - Anima 绘图大师在开启实验性 `img2img_enabled` 后支持单张原图重绘。
 - 参考图库只负责提供素材，最终能提交几张图由所选后端的能力上限决定；超出上限时会保留主

@@ -73,17 +73,17 @@ def path_within_roots(path: str, roots: tuple[str, ...]) -> bool:
 
 def endpoint_capabilities(endpoint: Mapping[str, Any]) -> BackendCapabilitiesV1:
     explicit = endpoint.get("capabilities") if isinstance(endpoint.get("capabilities"), Mapping) else {}
-    model = str(endpoint.get("model") or "").lower()
     platform = str(endpoint.get("platform") or "auto").lower()
-    inferred_reference = any(token in model for token in ("gpt-image", "gemini", "edit", "kontext"))
-    inferred_multi = bool(re.search(r"gpt[-_]?image[-_]?2", model))
-    reference_count = int(explicit.get("max_reference_images", 4 if inferred_multi else (1 if inferred_reference else 0)) or 0)
+    # 不再按模型名推断编辑/参考图能力（服务商以后改任何模型名都不受影响）：
+    # 默认允许提交 1 张参考图，成败与回退由实际请求结果决定；
+    # 需要精确控制时在端点 capabilities 里显式声明。
+    reference_count = int(explicit.get("max_reference_images", 1) or 0)
     roles = explicit.get("reference_roles")
     if not isinstance(roles, (list, tuple)):
         roles = ("identity", "outfit", "edit_source") if reference_count else ()
     return BackendCapabilitiesV1(
         text2img=bool(explicit.get("text2img", True)),
-        edit=bool(explicit.get("edit", inferred_reference)),
+        edit=bool(explicit.get("edit", True)),
         negative_prompt=bool(explicit.get("negative_prompt", platform in {"novelai", "nai", "openai", "openrouter"})),
         max_reference_images=max(0, reference_count),
         reference_roles=tuple(str(item) for item in roles),
